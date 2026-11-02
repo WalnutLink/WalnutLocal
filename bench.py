@@ -50,7 +50,7 @@ CASES = [
     ("10月26日跌的到底是光模块还是覆铜板", ["f154df"], "verbatim"),
     ("那天A股大跌是不是三季报引起的", ["133e3e", "616af8"], "paraphrase"),
     ("存储涨价这事，哪几家真的赚到了钱", ["c40774"], "paraphrase"),
-    ("佰维的存货跌价准备有没有转回进利润", ["95819a"], "verbatim"),
+    ("佰维的存货跌价准备有没有转回进利润", ["95819c"], "verbatim"),
     ("德明利为什么跌，公司有公告吗", ["7bf359", "dadda4"], "verbatim"),
     ("西部数据卖产能、德明利买颗粒，钱落在谁身上", ["dadda4"], "paraphrase"),
     ("Marvell收购Lumentum是多少钱", ["a9fd01"], "verbatim"),
@@ -122,6 +122,9 @@ def chars_of(rows):
 
 def run(idx, server):
     sfx = norm_ids(idx)
+    bad = [(q, a) for q, acc, _ in CASES for a in acc if a not in sfx.values()]
+    if bad:
+        print("⚠ 测试集里对不上的答案 id（会被算成漏）:", bad)
     full_chars = chars_of(idx.rows)
 
     systems = {

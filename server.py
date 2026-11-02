@@ -313,7 +313,13 @@ def op_context(a):
     # 库越大这一步越值钱（50,000 条时 1.3ms，逐条扫要 1.6 秒）。
     ix = _get_index()
     if ix is not None:
-        d = ix.query(text, top_k=top_k, floor=floor)
+        # parts: [(用户这句话, 1.0), (我上一轮在想的, 0.4), ...]
+        # 不传 parts 就是单段，退化成原来的行为。
+        parts = a.get("parts")
+        if isinstance(parts, list) and parts:
+            d = ix.query_multi(parts, top_k=top_k, floor=floor)
+        else:
+            d = ix.query(text, top_k=top_k, floor=floor)
         if not d.get("triggered"):
             return {"ok": True, "triggered": [], "others_related": 0,
                     "message": "这套记忆里没有跟这段话相关的东西。别硬扯。"}

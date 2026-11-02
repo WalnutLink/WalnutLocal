@@ -80,7 +80,7 @@ def _bigrams(s):
 
 
 # 虚词表：专名不会以这些字开头或结尾。这是判断"这串字是指称还是谓述"的最低成本办法。
-FUNC = set("的了是在和与也都就这不那个把被给对从到会能要有没我你他它说看做成为以及或但而吗呢吧还又很太更最着过得进出去来上下里中间些么自己将并且如果虽然因为所以然后而且并且")
+FUNC = set("的了是在和与也都就这不那个把被给对从到会能要有没我你他它说看做成为以及或但而吗呢吧还又很太更最着过得进出去来些么自己将并且如果虽然因为所以然后而且")
 
 def _nameish(g):
     """像不像专名：不夹虚词、内部二元组不常见。"""
@@ -217,9 +217,21 @@ class JudgmentIndex:
                 sdf[g] += 1
                 spost[g].add(r["id"])
         self.span_df = {g: d for g, d in sdf.items() if d <= span_cap}
+        # 话题名：出现得不少、但也谈不上通用的 4-5 字串（"中际旭创"这种）。
+        # 它进不了键表（出现太多次就不算"稀有"），但用户提到它时，
+        # 应该只在那几条里比较——名字是硬条件这条原则，对高频名字同样成立。
+        topic_hi = max(3, int(self.N * 0.30))
+        self.topic_index = {g: spost[g] for g, d in sdf.items()
+                            if 3 <= d <= topic_hi and len(g) >= 4
+                            and re.fullmatch(r"[\u4e00-\u9fa5]{4,5}", g) and _nameish(g)}
+        # 2 个字的串太容易偶然凑上（"问题""东西"在 68 条的库里都只出现一两次，
+        # 但它们不是键）。所以中文键最少 3 个字；2 个字的只留实体表里的名字和代码。
         for g, d in self.span_df.items():
-            if re.fullmatch(r"[\u4e00-\u9fa5]{2,5}", g) and not _nameish(g):
-                continue
+            if re.fullmatch(r"[\u4e00-\u9fa5]{2,5}", g):
+                if not _nameish(g):
+                    continue
+                if len(g) == 2 and g not in self.ent_index:
+                    continue
             self.key_index[g] = spost[g]
             self.key_df[g] = d
         self._span_cap = span_cap
@@ -232,6 +244,18 @@ class JudgmentIndex:
                     a, b = ents[i], ents[j]
                     self.graph[a][b] += 1.0
                     self.graph[b][a] += 1.0
+        # 预计算每条记录的两样东西。score() 里现算的话，5 万条时每轮几万次
+        # 正则 + 集合运算，索引表省下的时间会被这里吃回去（实测 116ms）。
+        # 建索引时算一次，之后每轮只查表。
+        self._rbg = {}
+        self._rent = {}
+        for r in self.rows:
+            t = _strip_meta(" ".join(str(r.get(k) or "") for k in
+                                     ("claim", "scope", "why", "tags", "resolve_by")))
+            self._rbg[r["id"]] = _bigrams(t)
+            self._rent[r["id"]] = set(harvest_entities(
+                " ".join(str(r.get(k) or "") for k in ("claim", "scope"))).keys())
+
         self.due.sort()
         self._build_time = round(time.time() - t0, 4)
 
@@ -281,6 +305,16 @@ class JudgmentIndex:
             kept.append(g)
         return kept[:6]
 
+    def topic_spans(self, text):
+        """问题里出现的高频话题名（≥4 字）。只枚举问题自身子串，不扫表。"""
+        low = (text or "").lower()
+        out = []
+        for n in (5, 4):
+            for g in _ngrams(low, (n,)):
+                if g in self.topic_index and g not in out:
+                    out.append(g)
+        return out
+
     def keys_in(self, text):
         return self.key_spans(text)
 
@@ -319,14 +353,13 @@ class JudgmentIndex:
             cand |= ids
         return cand, ents, qbg
 
-    def score(self, text, r, ents=None, qbg=None):
+    def _cov_ent(self, text, r, ents=None, qbg=None):
+        """一句话跟一条判断「像不像」。不含时间和状态，多段合并时只算一次时间。"""
         ents = ents if ents is not None else self._resolve_entities(text)
         qbg = qbg if qbg is not None else [b for b in _bigrams(text) if b not in self.stop_bg]
-        rtext = " ".join(str(r.get(k) or "") for k in
-                         ("claim", "scope", "why", "tags", "resolve_by"))
-        rbg = _bigrams(rtext)
+        rbg = self._rbg.get(r["id"]) or set()
 
-        # 分母必须把「库里根本没有的词」算进去，而且要按最强权重算。
+        # 分母必须把「库里根本没有的词」算进去，而且按最强权重算。
         # 2026-11-02 实测 bug：只算库里存在的词，问「今天天气怎么样」时
         # 六个二元组只有一个恰好撞上，于是覆盖度 = 100%，10 个无关问题触发 6 个。
         # 索引表的核心不是"我有什么"，是"我知道我没有什么"。
@@ -334,20 +367,15 @@ class JudgmentIndex:
         tot = sum(self.idf.get(b, idf_unseen) for b in qbg) or 1e-6
         hit = sum(self.idf.get(b, 0.0) for b in qbg if b in rbg)
         cov = min(1.0, hit / tot)
-        rare = [b for b in qbg if b in rbg and len(self.post.get(b, ())) <= max(2, self.N * 0.05)]
-        self._last_rare = len(rare)
-        self._last_cov = cov
+        rare = sum(1 for b in qbg if b in rbg
+                   and len(self.post.get(b, ())) <= max(2, self.N * 0.05))
 
-        rent = {self.ent_alias.get(e, e) for e in
-                harvest_entities(" ".join(str(r.get(k) or "") for k in ("claim", "scope")))}
+        rent = self._rent.get(r["id"]) or set()
         ent = 0.0
         hitent = []
         for e, form in ents.items():
             if e in rent:
-                if e in self.stop_ent:
-                    ent = max(ent, 0.15)
-                else:
-                    ent = max(ent, 0.55)
+                ent = max(ent, 0.15 if e in self.stop_ent else 0.55)
                 hitent.append(form)
         if ent == 0.0:
             for e in ents:
@@ -356,17 +384,16 @@ class JudgmentIndex:
                         ent = max(ent, 0.22)
                         hitent.append("~" + nb)
                         break
+        return cov, ent, hitent, rare
 
-        s = 0.62 * cov + 0.38 * ent
-
-        # 时间：越新越容易被想起
+    def _adjust(self, s, r):
+        """时间和状态。跟「像不像」分开算，多段合并后只乘一次。"""
         age_d = 0.0
         try:
             age_d = max(0.0, (time.time() - float(r.get("created") or 0)) / 86400.0)
         except Exception:
             pass
         s *= (0.78 + 0.22 * max(0.0, 1 - age_d / 180.0))
-
         st = r.get("status")
         s *= {"active": 1.12, "settled": 1.04, "dropped": 0.2}.get(st, 1.0)
         overdue = False
@@ -377,7 +404,11 @@ class JudgmentIndex:
                 pass
             if overdue:
                 s *= 1.15
+        return s, overdue
 
+    def score(self, text, r, ents=None, qbg=None):
+        cov, ent, hitent, rare = self._cov_ent(text, r, ents, qbg)
+        s, overdue = self._adjust(0.62 * cov + 0.38 * ent, r)
         why = []
         if cov > 0.05:
             why.append("字面 %.2f" % cov)
@@ -388,69 +419,109 @@ class JudgmentIndex:
         return round(min(s, 1.0), 3), "｜".join(why)
 
     def query(self, text, top_k=3, floor=FLOOR):
-        t0 = time.time()
-        if not text or len(text) < 6:
+        return self.query_multi([(text, 1.0)], top_k=top_k, floor=floor)
+
+    def query_multi(self, parts, top_k=3, floor=FLOOR,
+                    gate_cov=0.45, gate_rare=3, keys_only=False):
+        """多段一起想：用户这句话是主语，我上一轮在想什么只是线索。
+
+        parts = [(文本, 权重), ...]，第一段是用户当前这句。
+        2026-11-02 加这一层，来源是 AgentIR 那篇：检索该用 agent 的推理过程做查询，
+        不只是用户那句话。但直接拼成一坨是错的——我试过，长上文会把短问题淹掉
+        （历史每段 400 字，用户这句只有十几个字，字面覆盖全被上文占了）。
+        所以按段算分再加权：当前这句 1.0，我上一轮 0.4。
+        """
+        parts = [(t, w) for t, w in (parts or []) if t and len(str(t).strip()) >= 4]
+        if not parts:
             return {"ok": True, "triggered": [], "note": "太短，不值得想", "ms": 0}
-        cand, ents, qbg = self.candidates(text)
+        t0 = time.time()
+        main = parts[0][0]
 
-        # 专名是硬条件，不是加分项。
-        # 2026-11-02 实测：问「沪电那条…算我看错」，第一条是「10月28日涨得少的那一头」——
-        # 它靠"判断/看错"这些套话凑出 0.71 的字面分，压根没提沪电。
-        # 人不会把"沪电那条"想成别的公司，所以这里直接筛，不靠权重压。
-        hard = {e for e in ents if e in self.ent_index
-                and len(self.ent_index[e]) <= max(2, self.N * 0.05)}
-        if hard:
-            keep = set()
-            for e in hard:
-                keep |= set(self.ent_index.get(e) or ())
+        cand = set()
+        entsets, qbgs = [], []
+        for i, (text, w) in enumerate(parts):
+            c, e, q = self.candidates(text, cap=MAX_CAND if i == 0 else MAX_CAND // 2)
+            cand |= c
+            entsets.append(e)
+            qbgs.append(q)
+
+        # 专名硬条件：先看用户这句里的名字；这句没有，才用上文的。
+        def hard_of(es):
+            return {e for e in es if e in self.ent_index
+                    and len(self.ent_index[e]) <= max(2, self.N * 0.05)}
+        hard = hard_of(entsets[0]) or set().union(*[hard_of(e) for e in entsets[1:]]) if len(entsets) > 1 else hard_of(entsets[0])
+        keep = set()
+        for e in hard:
+            keep |= set(self.ent_index.get(e) or ())
+        if not keep:
+            # 没有实体表里的名字，就看问题上有没有"话题名"（中际旭创这类高频名字）
+            for g in self.topic_spans(main):
+                keep |= set(self.topic_index.get(g) or ())
             if keep:
-                cand = cand & keep if (cand & keep) else keep
+                cand = (cand & keep) or keep
+        elif keep:
+            cand = (cand & keep) or keep
 
+        keys_any = set()
+        for text, w in parts:
+            keys_any |= set(self.key_spans(text))
+            keys_any |= set(self.topic_spans(text))   # 高频名字也是键
+
+        # 合并方式：取"谁更像就用谁"，不给权重做除法。
+        # 2026-11-02 实测教训：原来按 1.0/1.4 加权平均，上文的证据被稀释掉，
+        # 12 条追问只中 7 条，反而不如直接把上文拼成一坨（中 11 条）。
+        # 正确的直觉是：当前这句有信号就听它的，没信号才让上文接住。
+        PREV_DISCOUNT = 0.85
         scored = []
         for rid in cand:
             r = self.by_id.get(rid)
             if not r:
                 continue
-            s, why = self.score(text, r, ents, qbg)
+            best = 0.0
+            main_cov = main_rare = 0.0
+            cov_gate = rare_gate = 0.0
+            why = []
+            for i, ((text, w), ents, qbg) in enumerate(zip(parts, entsets, qbgs)):
+                cov, ent, hitent, rare = self._cov_ent(text, r, ents, qbg)
+                part_s = 0.62 * cov + 0.38 * ent
+                part_s *= (1.0 if i == 0 else PREV_DISCOUNT)
+                if part_s > best:
+                    best = part_s
+                if i == 0:
+                    main_cov, main_rare = cov, rare
+                if cov > cov_gate:
+                    cov_gate, rare_gate = cov, rare
+                if hitent:
+                    why.append(("" if i == 0 else "上文提到 ") + "、".join(hitent[:3]))
+            s, overdue = self._adjust(best, r)
             if s < floor:
                 continue
-            # 触发闸：光"有点像"不算想起。
-            # 主判据是「问题里有没有这库认得的专名」——那是键命中；
-            # 没有专名时，才退回到"稀有词覆盖够高"这条弱判据。
-            keys = self.keys_in(text)
-            if keys:
-                keyed = True
-            else:
-                keyed = (getattr(self, "_last_cov", 0) >= 0.45
-                         and getattr(self, "_last_rare", 0) >= 3)
-            if not keyed:
+            # 触发闸：要么问题里有这库认得的键（任一段），要么某一段的稀有词撞得够多。
+            if keys_only:
+                if not keys_any:
+                    continue
+            elif not (keys_any or (cov_gate >= gate_cov and rare_gate >= gate_rare)):
                 continue
-            if s >= floor:
-                scored.append((s, why, r))
+            head = []
+            if main_cov > 0.05:
+                head.append("字面 %.2f" % main_cov)
+            head.extend(why)
+            if overdue:
+                head.append("已过期")
+            scored.append((round(min(s, 1.0), 3), "｜".join(head), r))
+
         scored.sort(key=lambda x: -x[0])
+        tie = len(scored) >= 2 and (scored[0][0] - scored[1][0]) < TIE
         out = []
-        tie = False
-        if len(scored) >= 2 and (scored[0][0] - scored[1][0]) < TIE:
-            tie = True
         for s, why, r in scored[:top_k]:
-            out.append({
-                "id": r["id"],
-                "claim": r.get("claim", ""),
-                "src": r.get("src", ""),
-                "resolve_by": r.get("resolve_by", ""),
-                "due": r.get("due", ""),
-                "status": r.get("status", ""),
-                "score": s,
-                "why": why,
-            })
-        return {
-            "ok": True,
-            "triggered": out,
-            "others_related": max(0, len(scored) - len(out)),
-            "ambiguous": tie,
-            "candidates": len(cand),
-            "ms": round((time.time() - t0) * 1000, 1),
-        }
+            out.append({"id": r["id"], "claim": r.get("claim", ""),
+                        "src": r.get("src", ""), "resolve_by": r.get("resolve_by", ""),
+                        "due": r.get("due", ""), "status": r.get("status", ""),
+                        "score": s, "why": why})
+        return {"ok": True, "triggered": out,
+                "others_related": max(0, len(scored) - len(out)),
+                "ambiguous": tie, "candidates": len(cand),
+                "ms": round((time.time() - t0) * 1000, 1)}
 
     def stats(self):
         return {
