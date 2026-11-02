@@ -273,6 +273,31 @@ def score(text, r, now=None):
     return round(min(s, 1.0), 3), why
 
 
+_IDX = {"key": None, "ix": None}
+
+
+def _get_index():
+    """按 items.jsonl 的 mtime 缓存索引。写新判断后下一次调用自动重建。"""
+    import importlib.util
+    path = os.path.join(DATA_DIR, "items.jsonl")
+    try:
+        key = (os.path.getmtime(path), os.path.getsize(path))
+    except OSError:
+        return None
+    if _IDX["key"] == key and _IDX["ix"] is not None:
+        return _IDX["ix"]
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("wl_index", os.path.join(here, "index.py"))
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+        ix = m.JudgmentIndex()
+    except Exception:
+        return None
+    _IDX["key"], _IDX["ix"] = key, ix
+    return ix
+
+
 def op_context(a):
     """像人一样：给一段话，返回它让你想起的那几条。不是搜索，是触发。
 
@@ -284,6 +309,33 @@ def op_context(a):
         return {"ok": False, "error": "text is required"}
     top_k = min(int(a.get("top_k") or 3), 5)
     floor = float(a.get("floor") or 0.22)
+    # 走索引表：先按专名/稀有词把候选收敛到 60 条以内，再精排。
+    # 库越大这一步越值钱（50,000 条时 1.3ms，逐条扫要 1.6 秒）。
+    ix = _get_index()
+    if ix is not None:
+        d = ix.query(text, top_k=top_k, floor=floor)
+        if not d.get("triggered"):
+            return {"ok": True, "triggered": [], "others_related": 0,
+                    "message": "这套记忆里没有跟这段话相关的东西。别硬扯。"}
+        out = []
+        for x in d["triggered"]:
+            out.append({"id": x["id"], "claim": x["claim"],
+                        "src": x["src"] or "(none - unverified)",
+                        "resolve_by": x.get("resolve_by") or "",
+                        "due": x.get("due") or "", "status": x.get("status"),
+                        "outcome": "", "score": x["score"],
+                        "triggered_by": x.get("why") or ""})
+        note = ("先说这几条，再决定要不要用。src 为空就是没出处，别当成已核实。"
+                "如果这条跟现在的事实相反，说清楚哪个对、为什么改。")
+        if d.get("ambiguous"):
+            note += "另外：前两条分数几乎一样，说明这句话指的不止一件，别挑一条当定论。"
+        return {"ok": True, "triggered": out,
+                "others_related": d.get("others_related", 0),
+                "candidates": d.get("candidates", 0),
+                "ambiguous": d.get("ambiguous", False),
+                "ms": d.get("ms"), "note": note}
+
+    # 索引坏了就退回逐条扫，绝不因为索引挂了就"想不起来"
     rows = load()
     scored = []
     for r in rows:
